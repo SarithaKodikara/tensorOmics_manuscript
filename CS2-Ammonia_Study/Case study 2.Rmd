@@ -1,0 +1,654 @@
+---
+title: "Case Study 2: Dual-Omic Integration in Anaerobic Digestion"
+output: html_document
+date: "2025-11-26"
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this vignette, we demonstrate how tensor Partial Least Squares (tPLS) enables longitudinal dual-omic integration by analyzing metabolomic data from an anaerobic digestion study [@wang2024inhibition]. This study examined how different ammonia sources affect anaerobic digestion performance using a time-course metabolomics framework.
+
+## Study Design
+
+The researchers established twelve 1 L laboratory-scale batch anaerobic digesters with a working volume of 700 mL:
+
+- **3 replicates**: Uninhibited controls
+- **9 inhibited digesters**: Three ammonia sources (3 replicates each)
+  - 14.9 g ammonium carbonate
+  - 16.6 g ammonium chloride  
+  - 20.5 g ammonium hydrogen phosphate
+
+The experiment ran for nine weeks with weekly sampling on days 0, 6, 13, 20, 27, 34, 41, 48, and 55. Samples were centrifuged to separate supernatant and pellet fractions, enabling paired metabolomic profiling of both compartments.
+
+## Data Preprocessing
+
+Metabolites whose total intensity contributed less than $0.01\%$ of the overall signal were removed. The remaining features were log-transformed after adding a pseudocount of one. Due to high variability between day 0 and day 6, the analysis focused on days 6-55 (8 time points).
+
+## Analysis Goal
+
+We use tPLS to model the temporal covariance between supernatant and pellet metabolomes, identifying:
+
+1. How treatment effects manifest across both compartments
+2. Which metabolites drive coordinated responses between layers
+3. The temporal stability of cross-compartment metabolic coordination
+
+---
+
+```{r visualizations-info, echo=FALSE, results='asis'}
+cat('
+<div style="background-color: #f0f8ff; border-left: 5px solid #4682b4; padding: 15px; margin: 20px 0; border-radius: 5px;">
+
+<strong style="color: #2c5282; font-size: 16px;">Understanding the Visualizations</strong>
+
+<p>This vignette uses three complementary visualization types:</p>
+
+<strong style="color: #2c5282;">Sample Plots (Score Plots)</strong>
+
+<p>Sample plots show how replicates are positioned in the reduced dimensional space:</p>
+
+<ul>
+<li><strong>Each point</strong> represents a replicate\'s complete temporal trajectory across both metabolomic layers</li>
+<li><strong>Distance between points</strong> reflects similarity in metabolic profiles</li>
+<li><strong>Axes (Components)</strong>: Each axis represents a latent component capturing covariance between supernatant and pellet</li>
+<li><strong>Color coding</strong>: Points are colored by treatment group (Control = orange, Carbonate = green, Chloride = blue, Phosphate = pink)</li>
+</ul>
+
+<strong style="color: #2c5282;">Loading Plots (Variable Contribution Plots)</strong>
+
+<p>Loading plots reveal which metabolites drive the separation between treatment groups:</p>
+
+<ul>
+<li><strong>Left panel (Bar plot)</strong>: Displays absolute loading values ordered by magnitude. Positive loadings (pink) associate with groups on the positive side of the component, while negative loadings (blue) associate with the negative side.</li>
+
+<li><strong>Right panel (Line plot)</strong>: Shows mean temporal profiles of the corresponding metabolites for each group, revealing how metabolite abundance changes over time.</li>
+</ul>
+
+<strong style="color: #2c5282;">Correlation Density Heatmaps</strong>
+
+<p>These heatmaps visualize the temporal stability of metabolic coordination between compartments:</p>
+
+<ul>
+<li><strong>Each column</strong> represents a metabolite pair (supernatant/pellet)</li>
+<li><strong>Y-axis</strong>: Correlation values ranging from -1 to 1</li>
+<li><strong>Color intensity</strong>: Darker regions indicate higher density of correlations across time points</li>
+<li><strong>Red column labels</strong>: Predominantly positive correlations (coordinated regulation)</li>
+<li><strong>Blue column labels</strong>: Predominantly negative correlations (antagonistic regulation)</li>
+</ul>
+
+<p>Concentrated dark bands indicate temporally stable relationships, while dispersed patterns suggest time-varying coordination.</p>
+
+</div>
+')
+```
+
+---
+
+# Setup and Data Loading
+
+## Load Required Libraries
+
+```{r libraries, warning=FALSE, message=FALSE}
+library(mixOmics)
+library(mixOmicsTemporal)
+library(dplyr)
+library(tidyr)
+library(plotly)
+library(gridExtra)
+library(patchwork)
+library(scales)
+library(stringr)
+library(purrr)
+library(ComplexHeatmap)
+library(RColorBrewer)
+library(ggnewscale)
+library(ggplot2)
+source("../helper/utility.R")
+
+set.seed(1234)
+
+# Define color scheme for groups
+ custom_colors <- c("Control" = "blue", 
+                     "Carbonate" = "orange", 
+                     "Chloride" = "green",
+                     "Phosphate"= "hotpink")
+```
+
+## Load and Prepare Data
+
+```{r load-data}
+# Read log-transformed metabolomic data
+load("Data_filtered/anaerobicStudy.RData") 
+
+
+
+# Read and prepare metadata
+meta <- meta_filtered %>%
+  mutate(Group_replicate = paste0(group, "_", replicate))
+
+# Merge metadata with metabolomic data
+merged_supernant_df <- merge(meta, LCMS_supernatant_log, 
+                              by = "row.names", all = TRUE)
+merged_pellet_df <- merge(meta, LCMS_pellet_log, 
+                          by = "row.names", all = TRUE)
+
+# Display data dimensions
+cat("Dataset dimensions:\n")
+cat("- Reactors:", length(unique(merged_supernant_df$Group_replicate)), "\n")
+cat("- Supernatant metabolites:", ncol(LCMS_supernatant_log), "\n")
+cat("- Pellet metabolites:", ncol(LCMS_pellet_log), "\n")
+cat("- Time points (days 6-55):", length(unique(merged_supernant_df$number_of_days)) - 1, "\n")
+```
+
+## Create Tensor Representation
+
+For tensor analysis, we organize data into a three-way array: replicates × metabolites × time.
+
+```{r create-tensor}
+# Calculate dimensions
+n <- length(unique(merged_supernant_df$Group_replicate))  # Number of replicates
+p <- ncol(LCMS_supernatant_log)                # Supernatant metabolites
+q <- ncol(LCMS_pellet_log)                   # Pellet metabolites
+t <- length(unique(merged_supernant_df$number_of_days))  # Time points
+
+# Initialize arrays
+pellet_Y_array <- array(0, dim = c(n, q, t))
+supernant_X_array <- array(0, dim = c(n, p, t))
+group_array <- array(NA, dim = c(n, 1, t))
+
+# Fill arrays for each time point
+for (i in 1:t) {
+  day <- unique(merged_supernant_df$number_of_days)[i]
+  indiv_index <- which(merged_supernant_df$number_of_days == day)
+  
+  pellet_Y_array[,,i] <- as.matrix(merged_pellet_df[indiv_index, -c(1:6)])
+  supernant_X_array[,,i] <- as.matrix(merged_supernant_df[indiv_index, -c(1:6)])
+  group_array[,,i] <- matrix(merged_supernant_df$group[indiv_index], ncol = 1)
+}
+
+# Focus on days 6-55 (exclude day 0 due to high variability)
+supernant_X_array <- supernant_X_array[,,2:9]
+pellet_Y_array <- pellet_Y_array[,,2:9]
+
+cat("Tensor structure:\n")
+cat("- Supernatant:", paste(dim(supernant_X_array), collapse = " × "), 
+    "(replicates × metabolites × time)\n")
+cat("- Pellet:", paste(dim(pellet_Y_array), collapse = " × "), 
+    "(replicates × metabolites × time)\n")
+```
+
+---
+
+# Tensor PLS Analysis
+
+## Model Fitting
+
+tPLS maximizes the covariance between supernatant and pellet metabolomes while preserving temporal structure. Unlike supervised methods, tPLS does not use group labels but instead identifies patterns of shared variation across the two compartments.
+
+```{r tpls-model}
+# Fit tPLS model with 4 components
+tpls_res <- tpls(
+  x = supernant_X_array,
+  y = pellet_Y_array,
+  ncomp = 4,
+  mode = "canonical"
+)
+
+# Create results dataframe
+res_df <- data.frame(
+  Group = group_array[,,1],
+  PC1_x = tpls_res$x_projected[,1],
+  PC2_x = tpls_res$x_projected[,2],
+  PC3_x = tpls_res$x_projected[,3],
+  PC4_x = tpls_res$x_projected[,4],
+  PC1_y = tpls_res$y_projected[,1],
+  PC2_y = tpls_res$y_projected[,2],
+  PC3_y = tpls_res$y_projected[,3],
+  PC4_y = tpls_res$y_projected[,4]
+)
+rownames(res_df) <- unique(merged_supernant_df$Group_replicate)
+
+head(res_df)
+```
+
+---
+
+# Results and Interpretation
+
+## Component 1: Primary Treatment Separation
+
+Component 1 captures the dominant source of variation, separating Control and Chloride groups from Carbonate and Phosphate treatments.
+
+### Supernatant Layer
+
+```{r comp1-supernatant-plot, fig.height=5, fig.width=6}
+ggplot(res_df, aes(x = PC1_x, y = PC2_x, color = Group)) +
+  geom_point(size = 3) +
+  ggtitle("Supernatant (Component 1 & 2)") +
+  theme_bw() +
+  scale_color_manual(values = custom_colors) +
+  xlab("Component 1") +
+  ylab("Component 2") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    text = element_text(size = 12),
+    legend.position = "right"
+  )
+```
+
+**Observations**: 
+
+- Component 1 clearly separates Control/Chloride (negative side) from Carbonate/Phosphate (positive side)
+- Component 2 provides additional discrimination, placing Phosphate and Chloride on the negative side and Carbonate and Control on the positive side
+
+```{r comp1-supernatant-loading, fig.height=8}
+loadingPlot(
+    loadings = tpls_res$x_loadings,
+    merged_df = merged_supernant_df,
+    comp = 1,
+    top = 8,
+    negGroup = c("Control", "Chloride"),
+    posGroup = c("Carbonate", "Phosphate"),
+    group_col = "group",
+    time_col = "number_of_days",
+    id_col = "replicate",
+    feature_start_col = 7,
+    feature_label = "Metabolite",
+    time_label = "6",
+    use_letters = FALSE,  # Show full metabolite names
+    group_colors = c(
+      "Control" = "blue", 
+      "Carbonate" = "orange", 
+      "Chloride" = "green", 
+      "Phosphate" = "hotpink"
+    )
+  )
+```
+
+**Key findings**:
+
+- **Positive loadings (Carbonate/Phosphate)**: Six of the top eight metabolites (m87, m104, m217, m451, m366, m111) showed predominantly positive loadings, driving separation toward Carbonate and Phosphate treatments
+- **Negative loadings (Control/Chloride)**: Only m72 and m316 exhibited negative loadings, contributing to Control and Chloride separation
+- **Temporal dynamics**: Some metabolites remained stable across time within groups (e.g., m104, m316), while others showed treatment- and time-specific dynamics (e.g., m111, m366)
+
+### Pellet Layer
+
+```{r comp1-pellet-plot, fig.height=5, fig.width=6}
+ggplot(res_df, aes(x = PC1_y, y = PC2_y, color = Group)) +
+  geom_point(size = 3) +
+  ggtitle("Pellet (Component 1 & 2)") +
+  theme_bw() +
+  scale_color_manual(values = custom_colors) +
+  xlab("Component 1") +
+  ylab("Component 2") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    text = element_text(size = 12),
+    legend.position = "right"
+  )
+```
+
+**Observations**: 
+
+The pellet fraction showed similar overall structure to the supernatant, though Control and Chloride groups clustered more closely together.
+
+```{r comp1-pellet-loading, fig.height=8}
+
+loadingPlot(
+    loadings = tpls_res$y_loadings,
+    merged_df = merged_pellet_df,
+    comp = 1,
+    top = 8,
+    negGroup = c("Control", "Chloride"),
+    posGroup = c("Carbonate", "Phosphate"),
+    group_col = "group",
+    time_col = "number_of_days",
+    id_col = "replicate",
+    feature_start_col = 7,
+    feature_label = "Metabolite",
+    time_label = "6",
+    use_letters = FALSE,  # Show full metabolite names
+    group_colors = c(
+      "Control" = "blue", 
+      "Carbonate" = "orange", 
+      "Chloride" = "green", 
+      "Phosphate" = "hotpink"
+    )
+  )
+```
+
+**Key findings**:
+
+- **Negative loadings (Control/Chloride)**: Six metabolites (m269, m254, m181, m96, m211, m205) dominated with negative loadings, driving Control and Chloride toward the negative side
+- **Positive loadings (Carbonate/Phosphate)**: Only m58 and m86 showed positive loadings, both declining over time in Carbonate and Phosphate treatments
+- **Complementary patterns**: Metabolites with negative loadings tended to remain stable or slightly increase in Control and Chloride, mirroring opposite regulatory patterns to those in the supernatant
+
+---
+
+## Component 2: Refined Treatment Discrimination
+
+Component 2 provides further discrimination among treatments, particularly highlighting the distinct metabolic signature of Phosphate.
+
+### Supernatant Component 2
+
+```{r comp2-supernatant-loading, fig.height=8}
+loadingPlot(
+    loadings = tpls_res$x_loadings,
+    merged_df = merged_supernant_df,
+    comp = 2,
+    top = 8,
+    negGroup = c("Phosphate", "Chloride"),
+    posGroup = c("Carbonate", "Control", "Chloride"),
+    group_col = "group",
+    time_col = "number_of_days",
+    id_col = "replicate",
+    feature_start_col = 7,
+    feature_label = "Metabolite",
+    time_label = "6",
+    use_letters = FALSE,  # Show full metabolite names
+    group_colors = c(
+      "Control" = "blue", 
+      "Carbonate" = "orange", 
+      "Chloride" = "green", 
+      "Phosphate" = "hotpink"
+    )
+  )
+
+
+```
+
+**Key findings**:
+
+- Component 2 showed predominantly positive loadings among top contributors
+- **Phosphate-specific patterns**: Reduced levels in several metabolites (m316, m164, m150, m101) in Phosphate treatment
+- **Elevated in Phosphate/Chloride**: Some metabolites (m95, m70) showed higher levels in these treatments
+- **Literature validation**: The behavior of m95 aligns with findings from Wang et al. (2024)
+
+### Pellet Component 2
+
+```{r comp2-pellet-loading, fig.height=8}
+
+loadingPlot(
+    loadings = tpls_res$y_loadings,
+    merged_df = merged_pellet_df,
+    comp = 2,
+    top = 8,
+    negGroup = c("Phosphate", "Chloride"),
+    posGroup = c("Carbonate", "Control", "Chloride"),
+    group_col = "group",
+    time_col = "number_of_days",
+    id_col = "replicate",
+    feature_start_col = 7,
+    feature_label = "Metabolite",
+    time_label = "6",
+    use_letters = FALSE,  # Show full metabolite names
+    group_colors = c(
+      "Control" = "blue", 
+      "Carbonate" = "orange", 
+      "Chloride" = "green", 
+      "Phosphate" = "hotpink"
+    )
+  )
+
+```
+
+**Key findings**:
+
+- Component 2 showed weaker treatment effects compared to Component 1
+- **Mixed loading patterns**: Three of the top eight metabolites had negative loadings
+- **Stable abundance**: Two metabolites (m254, m192) maintained high abundance over time in all groups except Carbonate
+- **Phosphate signature**: Metabolites with positive loadings showed lowest average abundance in Phosphate, reinforcing its distinct metabolic profile
+
+---
+
+## Cross-Compartment Metabolic Coordination
+
+To characterize relationships between supernatant and pellet layers, we examined correlations between metabolite pairs across time points. We visualized these using density heatmaps, focusing on pairs with average absolute correlation above 0.6.
+
+### Component 1 Correlations
+
+```{r comp1-correlation-analysis}
+# Identify top contributing metabolites for Component 1
+comp1_supTop <- c(
+  names(merged_supernant_df[, c(1:6)]),
+  names(merged_supernant_df[, -c(1:6)])[
+    order(abs(tpls_res$x_loadings[,1]), decreasing = TRUE)[1:8]
+  ]
+)
+
+df_s_1 <- merged_supernant_df[, comp1_supTop]
+colnames(df_s_1)[-c(1:6)] <- paste0("s_", colnames(df_s_1)[-c(1:6)])
+
+comp1_pellTop <- c(
+  names(merged_pellet_df[, c(1:6)]),
+  names(merged_pellet_df[, -c(1:6)])[
+    order(abs(tpls_res$y_loadings[,1]), decreasing = TRUE)[1:8]
+  ]
+)
+
+df_p_1 <- merged_pellet_df[, comp1_pellTop]
+colnames(df_p_1)[-c(1:6)] <- paste0("p_", colnames(df_p_1)[-c(1:6)])
+
+df_1 <- merge(df_s_1, df_p_1, 
+              by = c("Row.names", "group", "number_of_days", 
+                     "Group_replicate", "id"))
+
+# Calculate correlations per time point
+s_vars <- colnames(df_s_1)[-c(1:6)]
+p_vars <- colnames(df_p_1)[-c(1:6)]
+
+cor_results <- df_1 %>%
+  group_by(number_of_days) %>%
+  summarise(
+    correlations = list({
+      dat <- pick(all_of(c(s_vars, p_vars)))
+      expand_grid(Variable1 = s_vars, Variable2 = p_vars) %>%
+        mutate(
+          correlation = map2_dbl(
+            Variable1, Variable2,
+            ~ cor(dat[[.x]], dat[[.y]], use = "pairwise.complete.obs")
+          ),
+          Var = paste0(Variable1, "/", Variable2)
+        )
+    })
+  ) %>%
+  unnest(correlations) %>%
+  filter(number_of_days != 0)
+
+# Calculate average correlations and filter
+avg_cor_results <- cor_results %>%
+  group_by(Var) %>%
+  summarise(
+    avg_correlation = mean(abs(correlation), na.rm = TRUE),
+    sign = mean(correlation, na.rm = TRUE) > 0
+  ) %>%
+  ungroup() %>%
+  filter(avg_correlation > 0.6) %>%
+  arrange(sign, desc(avg_correlation))
+
+# Create correlation matrix
+cor_matrix <- cor_results %>%
+  select(number_of_days, Var, correlation) %>%
+  pivot_wider(names_from = Var, values_from = correlation) %>%
+  select(-number_of_days) %>%
+  select(avg_cor_results$Var)
+
+label_col <- ifelse(avg_cor_results$sign, "red", "blue")
+```
+
+```{r comp1-correlation-heatmap, fig.height=6, fig.width=10}
+p1 <- densityHeatmap(
+  cor_matrix,
+  title = "Component 1: Cross-Compartment Correlations",
+  ylab = "Correlation",
+  col = colorRampPalette(c("white", brewer.pal(9, "YlOrRd")))(100),
+  column_names_gp = grid::gpar(col = label_col, fontsize = 10)
+)
+
+p1
+```
+
+**Interpretation**:
+
+- **Strong positive correlations**: Concentrated dark density regions indicate temporally stable positive associations
+- **Persistent coordination**: These stable positive correlations reflect parallel production or coupled consumption of metabolites across layers
+- **Negative correlations**: More dispersed and less stable, suggesting antagonistic interactions that vary with process stage and metabolic state
+
+### Component 2 Correlations
+
+```{r comp2-correlation-analysis}
+# Identify top contributing metabolites for Component 2
+comp2_supTop <- c(
+  names(merged_supernant_df[, c(1:6)]),
+  names(merged_supernant_df[, -c(1:6)])[
+    order(abs(tpls_res$x_loadings[,2]), decreasing = TRUE)[1:8]
+  ]
+)
+
+df_s_2 <- merged_supernant_df[, comp2_supTop]
+colnames(df_s_2)[-c(1:6)] <- paste0("s_", colnames(df_s_2)[-c(1:6)])
+
+comp2_pellTop <- c(
+  names(merged_pellet_df[, c(1:6)]),
+  names(merged_pellet_df[, -c(1:6)])[
+    order(abs(tpls_res$y_loadings[,2]), decreasing = TRUE)[1:8]
+  ]
+)
+
+df_p_2 <- merged_pellet_df[, comp2_pellTop]
+colnames(df_p_2)[-c(1:6)] <- paste0("p_", colnames(df_p_2)[-c(1:6)])
+
+df_2 <- merge(df_s_2, df_p_2,
+              by = c("Row.names", "group", "number_of_days",
+                     "Group_replicate", "id"))
+
+# Calculate correlations
+s_vars <- colnames(df_s_2)[-c(1:6)]
+p_vars <- colnames(df_p_2)[-c(1:6)]
+
+cor_results <- df_2 %>%
+  group_by(number_of_days) %>%
+  summarise(
+    correlations = list({
+      dat <- pick(all_of(c(s_vars, p_vars)))
+      expand_grid(Variable1 = s_vars, Variable2 = p_vars) %>%
+        mutate(
+          correlation = map2_dbl(
+            Variable1, Variable2,
+            ~ cor(dat[[.x]], dat[[.y]], use = "pairwise.complete.obs")
+          ),
+          Var = paste0(Variable1, "/", Variable2)
+        )
+    })
+  ) %>%
+  unnest(correlations) %>%
+  filter(number_of_days != 0)
+
+# Calculate averages and filter
+avg_cor_results <- cor_results %>%
+  group_by(Var) %>%
+  summarise(
+    avg_correlation = mean(abs(correlation), na.rm = TRUE),
+    sign = mean(correlation, na.rm = TRUE) > 0
+  ) %>%
+  ungroup() %>%
+  filter(avg_correlation > 0.6) %>%
+  arrange(sign, desc(avg_correlation))
+
+# Create matrix
+cor_matrix <- cor_results %>%
+  select(number_of_days, Var, correlation) %>%
+  pivot_wider(names_from = Var, values_from = correlation) %>%
+  select(-number_of_days) %>%
+  select(avg_cor_results$Var)
+
+label_col <- ifelse(avg_cor_results$sign, "red", "blue")
+```
+
+```{r comp2-correlation-heatmap, fig.height=6, fig.width=10}
+p2 <- densityHeatmap(
+  cor_matrix,
+  title = "Component 2: Cross-Compartment Correlations",
+  ylab = "Correlation",
+  col = colorRampPalette(c("white", brewer.pal(9, "YlOrRd")))(100),
+  column_names_gp = grid::gpar(col = label_col, fontsize = 10)
+)
+
+p2
+```
+
+**Interpretation**:
+
+- **Weaker correlations overall**: Consistent with Component 2 capturing less shared variance
+- **All positive correlations**: High-correlation pairs showed exclusively positive associations
+- **Greater temporal variability**: Wider distributions and reduced density peaks indicate more transient or treatment-specific interactions
+
+---
+
+# Summary and Conclusions
+
+## Key Findings
+
+This case study demonstrates how unsupervised tensor integration reveals coordinated biological responses when treatment effects dominate both within-omic variation and cross-omic covariance.
+
+### Treatment Separation
+
+tPLS successfully identified distinct metabolic signatures for each ammonium treatment:
+
+1. **Component 1**: Separated Control/Chloride from Carbonate/Phosphate
+2. **Component 2**: Further discriminated Phosphate as having a unique metabolic profile
+
+Each ammonium anion induced coordinated metabolic responses across supernatant and pellet compartments.
+
+### Cross-Compartment Coordination
+
+The correlation analysis revealed two types of metabolic coordination:
+
+1. **Persistent coordination** (Component 1): Strong, temporally stable positive correlations indicate sustained metabolic coupling across compartments
+2. **Transient interactions** (Component 2): Weaker correlations with greater temporal variability suggest treatment-specific or stage-dependent coordination
+
+### Complementary Metabolic Patterns
+
+tPLS identified complementary patterns between supernatant and pellet:
+
+- Supernatant metabolites primarily drove Carbonate/Phosphate separation through positive loadings
+- Pellet metabolites exhibited opposite regulatory patterns, with negative loadings dominating Control/Chloride separation
+- This complementary behavior reflects distinct but coordinated metabolic responses in each compartment
+
+## Methodological Insights
+
+### When to Use Unsupervised tPLS
+
+This analysis illustrates conditions where unsupervised tensor integration excels:
+
+1. **Strong experimental design**: Systematic treatment structure produces well-organized covariance
+2. **Treatment-dominated variation**: When treatment effects exceed inter-replicate variability
+3. **Dual-omic integration**: Modeling related molecular layers to identify shared drivers of variation
+
+### Contrast with Case Study 1
+
+Unlike the antibiotic study (Case Study 1) where strong inter-individual variability required supervised tPLS-DA, the anaerobic digestion study had systematic experimental design that produced clear structure. tPLS captured this directly by maximizing inter-omic associations without explicit supervision.
+
+## Biological Significance
+
+The findings confirm that:
+
+1. Different ammonia sources produce distinct metabolic signatures in anaerobic digestion systems
+2. These signatures manifest coordinately across both supernatant and pellet compartments
+3. Some metabolic coordination is persistent (Component 1), while other interactions are more dynamic (Component 2)
+4. The Phosphate treatment produces a particularly distinctive metabolic profile
+
+These results provide insights into how ammonia inhibition affects anaerobic digestion at the metabolic level and demonstrate the power of tensor methods for integrating multi-layer longitudinal omics data.
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+

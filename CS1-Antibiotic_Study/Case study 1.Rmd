@@ -1,0 +1,479 @@
+---
+title: 'Case study 1: Longitudinal Microbiome Analysis After Antibiotic'
+output: html_document
+date: "2025-11-26"
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this vignette, we will explore how supervised tensor analysis can enhance group separation in longitudinal microbiome data from an antibiotic study in @suez2018post. This study examined the microbiome recovery after a seven day antibiotic course. Participants were randomised to three groups: spontaneous recovery (CTR), autologous faecal microbiota transplantation (FMT), and commercial probiotics (PBX). The microbial composition was profiled across 42 days at multiple time points per participant.
+
+
+Standard multivariate methods flatten the data into matrices and treat repeated measurements as independent samples. This structure obscures temporal information and amplifies inter-individual variation. Tensor approaches resolve this issue by modelling subjects, features, and time jointly. 
+
+In this vignette, we compare:
+
+- PCA (unsupervised, matrix-based)
+
+- PLS-DA (supervised, matrix-based; with and without multilevel)
+
+- tPCA (unsupervised, tensor-based)
+
+- TEMPTED (unsupervised trajectory analysis)
+
+- tPLS-DA (supervised, tensor-based)
+
+We focus on how each method represents longitudinal data and how supervised tensor loadings help interpret discriminatory microbial signatures.
+
+---
+
+```{r visualizations-info, echo=FALSE, results='asis'}
+cat('
+<div style="background-color: #f0f8ff; border-left: 5px solid #4682b4; padding: 15px; margin: 20px 0; border-radius: 5px;">
+
+<strong style="color: #2c5282; font-size: 16px;">Understanding the Visualisations</strong>
+
+<p>Throughout this vignette, we use two complementary types of plots to interpret multivariate methods:</p>
+
+<strong style="color: #2c5282;">Sample Plots (Score Plots)</strong>
+
+<p>Sample plots show how individual samples or subjects are positioned in the reduced dimensional space:</p>
+
+<ul>
+<li><strong>Each point</strong> represents either an individual sample (in matrix-based methods) or a subject\'s entire temporal trajectory (in tensor-based methods)</li>
+<li><strong>Distance between points</strong> reflects similarity: points closer together have more similar microbial profiles</li>
+<li><strong>Axes (Components)</strong>: Each axis represents a latent component that captures variation in the data</li>
+<li><strong>Color coding</strong>: Points are colored by treatment group (CTR = blue, FMT = orange, PBX = green) to visualize group separation</li>
+<li><strong>Transparency/Alpha</strong> (in matrix-based plots): Indicates time progression, with earlier time points more transparent and later time points more opaque</li>
+</ul>
+
+<p><strong>Key difference:</strong> Matrix-based methods (PCA, PLS-DA) show each subject multiple times (once per time point), while tensor-based methods (tPCA, TEMPTED, tPLS-DA) show each subject exactly once, representing their complete temporal profile.</p>
+
+<p>Good group separation means points from the same treatment group cluster together and are well-separated from other groups.</p>
+
+<strong style="color: #2c5282;">Loading Plots (Variable Contribution Plots)</strong>
+
+<p>Loading plots reveal which taxa drive the separation between treatment groups:</p>
+
+<ul>
+<li><strong>Left panel (Bar plot)</strong>: Displays absolute loading values ordered by magnitude. Larger bars indicate stronger contributions to the model. Bars are colored by sign: positive loadings (pink) push subjects toward the positive side of the component axis, while negative loadings (blue) push toward the negative side.</li>
+
+<li><strong>Right panel (Line plot)</strong>: Shows mean temporal profiles of the corresponding taxa for each group, enabling comparison between their temporal dynamics and discriminant strength. This reveals how each taxon\'s abundance changes over time in different treatment groups.</li>
+</ul>
+
+<p>Together, these plots provide a complete picture: sample plots show <em>which groups separate</em>, while loading plots explain <em>which taxa drive that separation</em> and <em>how their abundances change over time</em>.</p>
+
+</div>
+')
+```
+
+---
+
+# Setup and Data Loading
+
+## Load Required Libraries
+
+```{r libraries, warning=FALSE, message=FALSE}
+# Install development version if needed
+# devtools::install_local("/path/to/mixOmicsTemporal")
+
+library(mixOmics)
+library(tOmics)
+library(dplyr)
+library(tidyr)
+library(plotly)
+library(gridExtra)
+library(patchwork)
+library(tempted)
+library(scales)
+library(ggtext)
+library(ggrepel)  
+source("../helper/utility.R")
+
+# Define color scheme for groups
+custom_colors <- c("CTR" = "blue", "FMT" = "orange", "PBX" = "green")
+```
+
+## Load and Prepare Data
+
+In the original study, operational taxonomic units (OTUs) with relative abundances below $0.1\%$ were removed, and samples were rarefied to a sequencing depth of 10,000 reads. Here, we used the normalised dataset provided in TCAM [@mor2022dimensionality], which applied log-fold baseline normalisation prior to analysis.
+
+```{r load-data}
+# Load log fold change data
+load("data/antibioticStudy.Rdata") 
+
+# Set group as factor and sort
+merged_df$rGroup <- as.factor(merged_df$rGroup)
+merged_df <- merged_df %>%
+  arrange(rGroup, Participant, rDay)
+
+subjects <- unique(merged_df$Participant)
+
+
+# Data dimensions
+n <- length(unique(subjects))  # Number of subjects
+p <- ncol(merged_df) - 6                     # Number of taxa
+t <- length(unique(merged_df$rDay))          # Number of time points
+
+cat("Dataset dimensions:\n")
+cat("- Subjects:", n, "\n")
+cat("- Taxa:", p, "\n")
+cat("- Time points:", t, "\n")
+```
+
+## Create Tensor Representation
+
+```{r create-tensor}
+
+# Create group vector (one per subject, correct order)
+group_vec <- merged_df %>%
+  distinct(Participant, rGroup) %>%
+  arrange(match(Participant, subjects)) %>%
+  pull(rGroup)
+
+group_vec <- factor(group_vec)
+
+# Initialize arrays for tensor representation
+logfold_array <- array(0, dim = c(n, p, t))
+
+# Fill arrays with data for each time point
+for (i in 1:t) {
+  day <- unique(merged_df$rDay)[i]
+  indiv_index <- which(merged_df$rDay == day)
+  
+  logfold_array[, , i] <- as.matrix(merged_df[indiv_index, -c(1:6)])
+}
+
+cat("Tensor structure: subjects × taxa × time =", 
+    paste(dim(logfold_array), collapse = " × "), "\n")
+
+
+```
+
+---
+
+
+
+# Method Comparisons
+
+## Matrix-Based Methods
+
+### PCA: Unsupervised Matrix Approach
+
+PCA treats each time point from each participant as an independent sample, resulting in participants appearing multiple times in the ordination space.
+
+```{r pca}
+# Prepare feature table (matrix format)
+feature_table <- merged_df[, -c(1:6)]
+rownames(feature_table) <- paste(merged_df$Participant, merged_df$rDay, sep = "_")
+time_point <- merged_df$rDay
+
+# Run PCA
+pca_res <- pca(feature_table, ncomp = 2)
+
+# Create results dataframe
+res_df <- data.frame(
+  Group = merged_df$rGroup,  
+  Time = time_point,
+  PC1 = pca_res$variates$X[, 1], 
+  PC2 = pca_res$variates$X[, 2]
+)
+
+# Visualize
+ggplot(res_df, aes(x = PC1, y = PC2, color = Group, alpha = Time)) +
+  geom_point(size = 3) +
+  ggtitle("PCA: Matrix-Based Unsupervised") +
+  theme_bw() +
+  scale_color_manual(values = custom_colors) +
+  scale_alpha(range = c(0.3, 1)) +
+  xlab("Component 1") +
+  ylab("Component 2") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    text = element_text(size = 12),
+    legend.position = "right"
+  )
+```
+
+**Results**: PCA did not separate the three treatment groups. The ordination was dominated by strong inter-individual variability, with time points from the same participant scattered throughout the space.
+
+### PLS-DA: Supervised Matrix Approach
+
+PLS-DA incorporates treatment group information but still treats repeated observations as independent.
+
+```{r plsda}
+# Run PLS-DA
+plsda_res <- plsda(feature_table, merged_df$rGroup, ncomp = 2)
+
+# Create results dataframe
+res_df <- data.frame(
+  Group = merged_df$rGroup,  
+  Time = time_point,
+  PC1 = plsda_res$variates$X[, 1], 
+  PC2 = plsda_res$variates$X[, 2]
+)
+
+# Visualize
+ggplot(res_df, aes(x = PC1, y = PC2, color = Group, alpha = Time)) +
+  geom_point(size = 3) +
+  ggtitle("PLS-DA: Matrix-Based Supervised") +
+  theme_bw() +
+  scale_color_manual(values = custom_colors) +
+  scale_alpha(range = c(0.3, 1)) +
+  xlab("Component 1") +
+  ylab("Component 2") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    text = element_text(size = 12),
+    legend.position = "right"
+  )
+```
+
+**Results**: PLS-DA produced clearer separation between groups compared to PCA. However, it still violates the repeated-measures structure by treating observations from the same individual as independent.
+
+---
+
+## Tensor-Based Methods
+
+### tPCA: Unsupervised Tensor Approach
+
+tPCA represents each participant by a single point corresponding to their full temporal trajectory.
+
+```{r tpca}
+# Run tPCA
+tpca_res <- tpca(logfold_array, ncomp = 3)
+
+# Create results dataframe
+res_df <- data.frame(
+  Group = group_vec, 
+  PC1 = tpca_res$variates[, 1], 
+  PC2 = tpca_res$variates[, 2], 
+  PC3 = tpca_res$variates[, 3]
+)
+rownames(res_df) <- unique(merged_df$Participant)
+
+# Visualize
+ggplot(res_df, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3) +
+  ggtitle("tPCA: Tensor-Based Unsupervised") +
+  theme_bw() +
+  scale_color_manual(values = custom_colors) +
+  xlab("Component 1") +
+  ylab("Component 2") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    text = element_text(size = 12),
+    legend.position = "right"
+  )
+```
+
+**Results**: tPCA correctly represents each subject as a single point (no duplication), preserving temporal structure. However, like unsupervised PCA, it did not fully differentiate treatment groups, primarily capturing subject-specific variation.
+
+### TEMPTED: Trajectory-Based Analysis
+
+TEMPTED extracts smoothed temporal factors but does not use group labels.
+
+```{r tempted, warning=FALSE}
+# Run TEMPTED
+subject_id <- merged_df$Participant
+
+res_count <- tempted_all(
+  feature_table,
+  time_point,
+  subject_id,
+  threshold = 0.95,
+  transform = "none",
+  pseudo = 0.5,
+  r = 2,
+  smooth = 1e-5,
+  pct_ratio = 0.1,
+  pct_aggregate = 1
+)
+
+# Create results dataframe
+res_df <- data.frame(
+  Group = group_vec,  
+  PC1 = res_count$A_hat[, 1], 
+  PC2 = res_count$A_hat[, 2]
+)
+rownames(res_df) <- unique(merged_df$Participant)
+
+# Visualize
+ggplot(res_df, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3) +
+  ggtitle("TEMPTED: Trajectory-Based Unsupervised") +
+  theme_bw() +
+  scale_color_manual(values = custom_colors) +
+  xlab("Component 1") +
+  ylab("Component 2") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    text = element_text(size = 12),
+    legend.position = "right"
+  )
+```
+
+**Results**: TEMPTED summarized global temporal variation but did not separate treatment groups. Like tPCA, the embedding remained dominated by inter-individual structure.
+
+### tPLS-DA: Supervised Tensor Approach
+
+tPLS-DA integrates treatment information while modeling data as a tensor, preserving within-subject temporal structure.
+
+```{r tplsda}
+# Run tPLS-DA
+tplsda_res <- tplsda(logfold_array, group_vec, ncomp = 3)
+
+# Create results dataframe
+res_df <- data.frame(
+  Group = group_vec,  
+  PC1 = tplsda_res$x_projected[, 1], 
+  PC2 = tplsda_res$x_projected[, 2],
+  PC3 = tplsda_res$x_projected[, 3]
+)
+rownames(res_df) <- unique(merged_df$Participant)
+
+# Visualize
+ggplot(res_df, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3) +
+  ggtitle("tPLS-DA: Tensor-Based Supervised") +
+  theme_bw() +
+  scale_color_manual(values = custom_colors) +
+  xlab("Component 1") +
+  ylab("Component 2") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+    text = element_text(size = 12),
+    legend.position = "right"
+  )
+```
+
+**Results**: tPLS-DA produced the strongest separation among CTR, FMT, and PBX. By preserving within-subject temporal structure and incorporating supervision, this method effectively captured treatment-specific patterns.
+
+---
+
+# Biological Interpretation
+
+
+## Component 1: PBX vs CTR and FMT
+
+Component 1 separates PBX (negative side of Component 1) from CTR and FMT (positive side of Component 1).
+
+```{r comp1-loading, fig.height=8}
+
+loadingPlot(
+    loadings = tplsda_res$x_loadings,
+    merged_df = merged_df,
+    comp = 1,
+    top = 10,
+    negGroup =  c("PBX"),
+    posGroup = c( "CTR", "FMT"),
+    group_col = "rGroup",
+    time_col = "rDay",
+    id_col = "Participant",
+    feature_start_col = 7,
+    use_letters = TRUE,
+    group_colors = c("CTR" = "blue", "FMT" = "orange", "PBX" = "green")
+  )
+```
+
+**Key findings**:
+
+- **Elevated in PBX**: Only *Erysipelatoclostridium ramosum* showed higher abundance in PBX. Independent studies have reported enrichment of this species after probiotic intervention.
+
+- **Elevated in CTR/FMT**: The remaining top taxa were more abundant in control and FMT groups, including:
+  - *Parabacteroides merdae*
+  - *Bacteroides thetaiotaomicron*
+  - *Bacteroides ovatus* (linked to bile acid metabolism)
+  - *Dorea longicatena*
+  - *Roseburia inulinivorans*
+  - *Collinsella aerofaciens* (associated with beneficial recovery)
+
+Five of these taxa were previously identified as predictive recovery-associated species.
+
+## Component 2: CTR vs PBX and FMT
+
+Component 2 separates spontaneous recovery (CTR) from interventions (PBX and FMT).
+
+```{r comp2-loading, fig.height=8}
+
+loadingPlot(
+    loadings = tplsda_res$x_loadings,
+    merged_df = merged_df,
+    comp = 2,
+    top = 10,
+    negGroup =  c("PBX","FMT"),
+    posGroup = c( "CTR"),
+    group_col = "rGroup",
+    time_col = "rDay",
+    id_col = "Participant",
+    feature_start_col = 7,
+    use_letters = TRUE,
+    group_colors = c("CTR" = "blue", "FMT" = "orange", "PBX" = "green")
+  )
+```
+
+**Key findings**:
+
+- **Elevated in CTR**: *Flavonifractor plautii* was the only top taxon with higher abundance in spontaneous recovery.
+
+- **Elevated in FMT**: *Coprococcus eutactus* and *Bacteroides dorei* were elevated in the FMT group. Previous studies showed several *Coprococcus* species return to baseline levels after autologous FMT but not after spontaneous recovery.
+
+This component distinguishes the natural recovery trajectory from intervention-mediated changes.
+
+---
+
+# Summary and Conclusions
+
+## Method Performance
+
+## Method Performance
+
+<div style="display: flex; justify-content: center;">
+
+| Method | Supervision | Temporal Structure | Group Separation |
+|:--------:|:-----------:|:-----------------:|:----------------:|
+| PCA | No | No | Moderate |
+| PLS-DA | **Yes** | No | **Good** |
+| tPCA | No | **Yes** | Moderate |
+| TEMPTED | No | **Yes** | Moderate |
+| **tPLS-DA** | **Yes** | **Yes** | **Good** |
+
+</div>
+
+## Key Takeaways
+
+1. **Unsupervised methods** (PCA, tPCA, TEMPTED) failed to separate treatment groups, being dominated by inter-individual variation.
+
+2. **Matrix-based supervised analysis** (PLS-DA) improved separation but violated the repeated-measures structure.
+
+3. **Tensor-based supervised analysis** (tPLS-DA) provided optimal results by:
+   - Preserving within-subject temporal structure
+   - Incorporating treatment information
+   - Producing biologically interpretable loadings
+
+4. **Biological validation**: tPLS-DA identified treatment-specific signatures consistent with published literature:
+   - Recovery-associated taxa in CTR/FMT groups
+   - Probiotic-specific enrichment in PBX
+   - FMT-specific restoration patterns
+
+## Recommendations
+
+For longitudinal microbiome studies with treatment groups:
+
+- **Use tPLS-DA** when group discrimination is the primary goal
+- **Combine with tPCA** for exploratory analysis
+
+---
+
+# Session Information
+
+```{r session-info}
+sessionInfo()
+```
+
+# References
